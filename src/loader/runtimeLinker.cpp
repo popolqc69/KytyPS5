@@ -647,6 +647,30 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// Describe which loaded module (exe, Vulkan driver, system DLL, ...) contains a host address, so a
+// crash report can be mapped back to a binary. Guest code and heap are not in any module.
+static void PrintHostModuleInfo(const char* label, uint64_t address) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	HMODULE module = nullptr;
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       reinterpret_cast<LPCSTR>(static_cast<uintptr_t>(address)), &module) == 0 ||
+	    module == nullptr) {
+		std::printf("%s: 0x%016" PRIx64 " (not in a host module: guest code or heap)\n", label,
+		            address);
+		return;
+	}
+	char path[MAX_PATH] = "?";
+	GetModuleFileNameA(module, path, sizeof(path));
+	const char* name = std::strrchr(path, '\\');
+	name             = (name != nullptr ? name + 1 : path);
+	std::printf("%s: 0x%016" PRIx64 " = %s+0x%" PRIx64 "\n", label, address, name,
+	            address - reinterpret_cast<uint64_t>(module));
+#else
+	std::printf("%s: 0x%016" PRIx64 "\n", label, address);
+#endif
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -680,6 +704,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		std::printf("--- Guest fault context ---\n");
 		std::printf("thread: %s\n", thread_name);
+		PrintHostModuleInfo("pc", info->exception_address);
 		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
 		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
 		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
@@ -702,6 +727,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
 			}
 			std::printf("\n");
+			// Likely return addresses on the stack, resolved to modules: a poor man's backtrace.
+			for (int i = 0; i < 32; i++) {
+				if (IsReadableRange(stack[i], 1) && (stack[i] >> 40u) == 0x7fu) {
+					PrintHostModuleInfo("  maybe-return", stack[i]);
+				}
+			}
 		}
 		std::fflush(stdout);
 	}

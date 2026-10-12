@@ -25,6 +25,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -112,7 +113,13 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	// KYTY_DUMP_SPIRV=1 dumps generated SPIR-V without the other graphics debug dumps, for
+	// reproducing host driver compiler crashes offline.
+	static const bool env_dump = [] {
+		const char* value = std::getenv("KYTY_DUMP_SPIRV");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!Config::GraphicsDebugDumpEnabled() && !env_dump) {
 		return;
 	}
 	static std::atomic_int id = 0;

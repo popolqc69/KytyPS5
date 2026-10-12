@@ -671,6 +671,52 @@ static void PrintHostModuleInfo(const char* label, uint64_t address) {
 #endif
 }
 
+// Real backtrace using the x64 unwind tables (.pdata) of every loaded module, including drivers.
+// Walks from the faulting context so frames below a driver crash can be mapped back to the
+// emulator code that called into it.
+static void PrintHostBacktrace(const void* native_context) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (native_context == nullptr) {
+		return;
+	}
+	{
+		PWSTR description = nullptr;
+		if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &description)) &&
+		    description != nullptr) {
+			std::printf("host thread id=%lu name=\"%ls\"\n", GetCurrentThreadId(), description);
+			LocalFree(description);
+		} else {
+			std::printf("host thread id=%lu\n", GetCurrentThreadId());
+		}
+	}
+	CONTEXT ctx = *static_cast<const CONTEXT*>(native_context);
+	std::printf("backtrace:\n");
+	for (int frame = 0; frame < 64 && ctx.Rip != 0; frame++) {
+		char label[32];
+		std::snprintf(label, sizeof(label), "  #%02d", frame);
+		PrintHostModuleInfo(label, ctx.Rip);
+
+		DWORD64 image_base = 0;
+		auto*   function   = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+		if (function == nullptr) {
+			// Leaf function (or code without unwind info): return address is at [rsp].
+			if (!IsReadableRange(ctx.Rsp, sizeof(uint64_t))) {
+				break;
+			}
+			ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
+			ctx.Rsp += 8;
+		} else {
+			PVOID   handler_data = nullptr;
+			DWORD64 establisher  = 0;
+			RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, function, &ctx,
+			                 &handler_data, &establisher, nullptr);
+		}
+	}
+#else
+	(void)native_context;
+#endif
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -705,6 +751,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		std::printf("--- Guest fault context ---\n");
 		std::printf("thread: %s\n", thread_name);
 		PrintHostModuleInfo("pc", info->exception_address);
+		PrintHostBacktrace(info->native_context);
 		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
 		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
 		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"

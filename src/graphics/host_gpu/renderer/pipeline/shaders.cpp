@@ -20,6 +20,8 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <span>
 #include <vector>
@@ -572,7 +574,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	comp_shader_stage_info.pName  = "main";
 	EXIT_IF(!input_info.stage);
 	const auto wave_size = input_info.stage.program->wave_size;
-	if (graphics.compute_subgroup_size_control_enabled &&
+	// Debug switch: KYTY_NO_COMPUTE_SUBGROUP_SIZE=1 skips VkPipelineShaderStageRequiredSubgroupSize
+	// to test driver issues with forced wave sizes.
+	static const bool no_required_subgroup_size = [] {
+		const char* value = std::getenv("KYTY_NO_COMPUTE_SUBGROUP_SIZE");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!no_required_subgroup_size && graphics.compute_subgroup_size_control_enabled &&
 	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
 		comp_subgroup_size.requiredSubgroupSize = wave_size;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
@@ -612,6 +620,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
+	std::printf("CS pipeline: module=%p wave=%u required_subgroup=%u (min=%u max=%u)\n",
+	            static_cast<void*>(compute_module), static_cast<unsigned>(wave_size),
+	            comp_shader_stage_info.pNext != nullptr ? comp_subgroup_size.requiredSubgroupSize
+	                                                    : 0u,
+	            static_cast<unsigned>(graphics.min_subgroup_size),
+	            static_cast<unsigned>(graphics.max_subgroup_size));
+	std::fflush(stdout);
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",

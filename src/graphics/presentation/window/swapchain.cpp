@@ -266,7 +266,7 @@ public:
 	void                 Create();
 	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] bool   NeedsResize() const;
-	[[nodiscard]] Status AcquireNextImage();
+	[[nodiscard]] Status AcquireNextImage(CommandScheduler& scheduler);
 	[[nodiscard]] bool   PrepareSystemOverlay();
 	void     RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
 	                               const Presenter::Layer& overlay, bool draw_system_overlay);
@@ -302,6 +302,9 @@ private:
 	std::vector<vk::ImageView>     m_image_views;
 	std::vector<vk::Semaphore>     m_image_acquired;
 	std::vector<vk::Semaphore>     m_render_complete;
+	// Scheduler tick of the last submit that waited on m_image_acquired[i]. The semaphore may only
+	// be handed to vkAcquireNextImageKHR again once that wait has completed on the GPU.
+	std::vector<uint64_t>          m_image_acquired_ticks;
 	std::unique_ptr<SystemOverlay> m_system_overlay;
 	vk::DescriptorSetLayout        m_overlay_descriptors = nullptr;
 	vk::PipelineLayout             m_overlay_layout      = nullptr;
@@ -502,6 +505,7 @@ void Swapchain::Create() {
 	semaphore_info.sType = vk::StructureType::eSemaphoreCreateInfo;
 	m_image_acquired.resize(m_images.size());
 	m_render_complete.resize(m_images.size());
+	m_image_acquired_ticks.assign(m_images.size(), 0);
 	for (size_t i = 0; i < m_images.size(); i++) {
 		RequireVulkanSuccess(
 		    graphics.device.createSemaphore(&semaphore_info, nullptr, &m_image_acquired[i]),
@@ -570,6 +574,7 @@ void Swapchain::Destroy() {
 	m_image_views.clear();
 	m_image_acquired.clear();
 	m_render_complete.clear();
+	m_image_acquired_ticks.clear();
 }
 
 void Swapchain::Recreate(bool surface_lost) {
@@ -594,8 +599,15 @@ bool Swapchain::NeedsResize() const {
 	       m_window_extent.height != m_window.graphic_ctx.screen_height;
 }
 
-Swapchain::Status Swapchain::AcquireNextImage() {
+Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
+	// VUID-vkAcquireNextImageKHR-semaphore-01779: the previous submit that waited on this
+	// semaphore must have executed before it is reused, or the GPU may still be behind by a full
+	// swapchain's worth of frames (e.g. while long shader compilations stall the queue).
+	if (const auto tick = m_image_acquired_ticks[m_frame_index]; tick != 0) {
+		scheduler.Wait(tick);
+		m_image_acquired_ticks[m_frame_index] = 0;
+	}
 	m_image_index     = static_cast<uint32_t>(-1);
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
@@ -603,8 +615,10 @@ Swapchain::Status Swapchain::AcquireNextImage() {
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
+			// The image is acquired and the semaphore will be signaled: present it anyway and let
+			// vkQueuePresentKHR report suboptimal, instead of recreating with a pending signal.
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eSuboptimalKHR\n");
-			return Status::Recreate;
+			break;
 		case vk::Result::eErrorOutOfDateKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorOutOfDateKHR\n");
 			return Status::Recreate;
@@ -867,7 +881,9 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
-	return scheduler.Submit(submit);
+	const auto tick                       = scheduler.Submit(submit);
+	m_image_acquired_ticks[m_frame_index] = tick;
+	return tick;
 }
 
 Swapchain::Status Swapchain::Present() {
@@ -1023,7 +1039,7 @@ void Presenter::Impl::Present() {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
-		auto status = swapchain.AcquireNextImage();
+		auto status = swapchain.AcquireNextImage(present_scheduler);
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;

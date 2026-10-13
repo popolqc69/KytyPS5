@@ -717,6 +717,41 @@ static void PrintHostBacktrace(const void* native_context) {
 #endif
 }
 
+// Maps a guest address to "module+offset" using the loaded program list. Only for crash reports:
+// it takes the linker lock, which the faulting thread is not expected to hold.
+static bool PrintGuestLocation(const char* label, uint64_t address) {
+	auto* linker = Common::Singleton<RuntimeLinker>::Instance();
+	auto* p      = linker != nullptr ? linker->FindProgramByAddr(address) : nullptr;
+	if (p == nullptr) {
+		return false;
+	}
+	std::printf("%s: 0x%016" PRIx64 " = %s+0x%" PRIx64 "\n", label, address,
+	            Common::FilenameWithoutDirectory(Common::PathToGenericString(p->file_name)).c_str(),
+	            address - p->base_vaddr);
+	return true;
+}
+
+// Guest code usually runs without frame pointers, so scan the stack for values that land inside
+// a loaded guest module: most of them are return addresses of the callers.
+static void PrintGuestStackScan(uint64_t rsp) {
+	constexpr int MaxWords = 1024;
+	constexpr int MaxHits  = 24;
+	int           hits     = 0;
+	std::printf("guest stack scan (possible return addresses):\n");
+	for (int i = 0; i < MaxWords && hits < MaxHits; i++) {
+		const auto slot = rsp + static_cast<uint64_t>(i) * sizeof(uint64_t);
+		if (!IsReadableRange(slot, sizeof(uint64_t))) {
+			break;
+		}
+		const auto value = *reinterpret_cast<const uint64_t*>(slot);
+		char       label[48];
+		std::snprintf(label, sizeof(label), "  [rsp+0x%x]", i * 8);
+		if (value != 0 && PrintGuestLocation(label, value)) {
+			hits++;
+		}
+	}
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -751,6 +786,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		std::printf("--- Guest fault context ---\n");
 		std::printf("thread: %s\n", thread_name);
 		PrintHostModuleInfo("pc", info->exception_address);
+		PrintGuestLocation("guest pc", info->exception_address);
 		PrintHostBacktrace(info->native_context);
 		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
 		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
@@ -774,6 +810,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
 			}
 			std::printf("\n");
+			PrintGuestStackScan(info->rsp);
 			// Likely return addresses on the stack, resolved to modules: a poor man's backtrace.
 			for (int i = 0; i < 32; i++) {
 				if (IsReadableRange(stack[i], 1) && (stack[i] >> 40u) == 0x7fu) {

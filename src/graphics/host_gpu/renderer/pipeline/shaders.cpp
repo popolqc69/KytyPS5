@@ -210,6 +210,16 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
 }
 
+// KYTY_SKIP_FAILED_PIPELINES=1: when the host driver refuses a graphics pipeline, skip the draws
+// that need it instead of stopping the emulator. Missing draws mean visual glitches.
+static bool SkipFailedPipelines() {
+	static const bool skip = [] {
+		const char* value = std::getenv("KYTY_SKIP_FAILED_PIPELINES");
+		return value != nullptr && value[0] == '1';
+	}();
+	return skip;
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
@@ -549,9 +559,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
+		const auto* vs_program = vs_input_info.stage.program;
+		const auto* ps_program = ps_active ? ps_input_info->stage.program : nullptr;
+		std::printf("Graphics pipeline creation failed: result=%s VS=%016llx PS=%016llx\n",
+		            vk::to_string(result).c_str(),
+		            static_cast<unsigned long long>(vs_program != nullptr ? vs_program->shader_hash : 0),
+		            static_cast<unsigned long long>(ps_program != nullptr ? ps_program->shader_hash : 0));
+		std::fflush(stdout);
+		EXIT_NOT_IMPLEMENTED(!SkipFailedPipelines());
+		pipeline.pipeline = nullptr;
+	}
 
 	if (tess_control_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);

@@ -997,7 +997,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	                       ps_input_info, programs, static_params, m_driver_cache);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+	// A null pipeline is only left by KYTY_SKIP_FAILED_PIPELINES; draws using it are skipped.
+	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr &&
+	                     std::getenv("KYTY_SKIP_FAILED_PIPELINES") == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));

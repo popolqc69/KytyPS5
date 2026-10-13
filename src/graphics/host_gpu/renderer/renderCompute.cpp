@@ -29,14 +29,54 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
+
+// Workaround switch: KYTY_SKIP_CS=<hash>[,<hash>...] skips compute dispatches of the listed shader
+// hashes (as shown in _Shaders dump names) without creating their pipelines. Used to get past
+// host driver compiler crashes; the skipped work is simply missing, so expect visual glitches.
+static bool ShouldSkipComputeShader(uint64_t shader_hash) {
+	static const std::set<uint64_t> skip = [] {
+		std::set<uint64_t> hashes;
+		if (const char* value = std::getenv("KYTY_SKIP_CS"); value != nullptr) {
+			std::string list(value);
+			size_t      pos = 0;
+			while (pos < list.size()) {
+				const auto end   = list.find(',', pos);
+				const auto token = list.substr(pos, end == std::string::npos ? std::string::npos
+				                                                              : end - pos);
+				if (!token.empty()) {
+					hashes.insert(std::strtoull(token.c_str(), nullptr, 16));
+				}
+				if (end == std::string::npos) {
+					break;
+				}
+				pos = end + 1;
+			}
+		}
+		return hashes;
+	}();
+	if (skip.empty() || skip.count(shader_hash) == 0) {
+		return false;
+	}
+	static std::set<uint64_t> reported;
+	if (reported.insert(shader_hash).second) {
+		std::printf("KYTY_SKIP_CS: skipping compute shader %016llx\n",
+		            static_cast<unsigned long long>(shader_hash));
+		std::fflush(stdout);
+	}
+	return true;
+}
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -298,6 +338,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	if (ShouldSkipComputeShader(input_info.stage.program->shader_hash)) {
+		ResetBindings();
+		return;
+	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -454,6 +498,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	input_info.async_compute = async_compute;
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	if (ShouldSkipComputeShader(input_info.stage.program->shader_hash)) {
+		ResetBindings();
+		return;
+	}
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;

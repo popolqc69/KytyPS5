@@ -31,6 +31,7 @@
 #include <limits>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
+#include <spirv-tools/optimizer.hpp>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -152,6 +153,47 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 		return;
 	}
 	file.Write(code.data(), code.size_bytes());
+}
+
+// Applies the "Shader optimization" setting with SPIRV-Tools. Besides shrinking shaders, this
+// changes the SPIR-V that host drivers see, which can avoid some driver compiler crashes.
+// The original SPIR-V is kept when optimization fails or produces invalid output.
+void OptimizeShaderSpirv(const char* label, uint64_t shader_hash, std::vector<uint32_t>& spirv) {
+	const auto type = Config::GetShaderOptimizationType();
+	if (type == Config::ShaderOptimizationType::None) {
+		return;
+	}
+	spvtools::Optimizer optimizer(SPV_ENV_VULKAN_1_3);
+	std::string         messages;
+	optimizer.SetMessageConsumer([&messages](spv_message_level_t level, const char*,
+	                                         const spv_position_t&, const char* message) {
+		if (level <= SPV_MSG_ERROR) {
+			messages += message;
+			messages += '\n';
+		}
+	});
+	if (type == Config::ShaderOptimizationType::Size) {
+		optimizer.RegisterSizePasses();
+	} else {
+		optimizer.RegisterPerformancePasses();
+	}
+	std::vector<uint32_t> optimized;
+	if (!optimizer.Run(spirv.data(), spirv.size(), &optimized) || optimized.empty()) {
+		LOGF_COLOR(Log::Color::BrightRed,
+		           "%s SPIR-V optimization failed hash=0x%016" PRIx64 ", keeping original:\n%s",
+		           label, shader_hash, messages.c_str());
+		return;
+	}
+	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+	tools.SetMessageConsumer([](spv_message_level_t, const char*, const spv_position_t&,
+	                            const char*) {});
+	if (!tools.Validate(optimized)) {
+		LOGF_COLOR(Log::Color::BrightRed,
+		           "%s optimized SPIR-V is invalid hash=0x%016" PRIx64 ", keeping original\n",
+		           label, shader_hash);
+		return;
+	}
+	spirv = std::move(optimized);
 }
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
@@ -308,6 +350,7 @@ struct PipelineCache::ProgramCache {
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
 		}
+		OptimizeShaderSpirv(options.dump_label, options.shader_hash, result.spirv);
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
 		const auto module = CompileSPV(result.spirv, device);
